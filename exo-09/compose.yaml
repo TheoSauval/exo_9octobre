@@ -1,0 +1,45 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: dogsdb
+      POSTGRES_USER: dogs
+      POSTGRES_PASSWORD: dogspass
+    ports:
+      - "5433:5432"          # accès depuis l'hôte (développement local)
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dogs -d dogsdb"]
+      interval: 2s
+      retries: 30
+
+  log-api:
+    build: ./log-api
+    image: log-api
+    environment:
+      LOGS_FILE: /data/logs.jsonl
+    ports:
+      - "8082:8080"
+    volumes:
+      - logs-data:/data
+
+  crud-api:
+    build: ./crud-api
+    image: crud-api
+    environment:
+      DB_URL: jdbc:postgresql://db:5432/dogsdb
+      DB_USER: dogs
+      DB_PASSWORD: dogspass
+      LOGS_API_URL: http://log-api:8080/api/v1/logs
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      log-api:
+        condition: service_started
+
+volumes:
+  db-data:
+  logs-data:

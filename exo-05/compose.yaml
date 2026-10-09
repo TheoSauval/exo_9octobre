@@ -1,0 +1,29 @@
+services:
+  mysql-db:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: ecole
+      MYSQL_USER: theo
+      MYSQL_PASSWORD: theopass
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks:
+      - reseau-exo5
+
+  adminer:
+    image: adminer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      - mysql-db
+    networks:
+      - reseau-exo5
+
+volumes:
+  mysql-data:
+
+networks:
+  reseau-exo5:
