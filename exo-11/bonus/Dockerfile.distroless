@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1.7
+# Variante B1 : runtime distroless (pas de shell, pas de wget, pas de gestionnaire de paquets)
+
+ARG NODE_IMAGE=node:20.20.2-alpine3.22
+
+FROM ${NODE_IMAGE} AS base
+WORKDIR /app
+COPY package.json package-lock.json ./
+
+FROM base AS test
+RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
+COPY src ./src
+COPY test ./test
+RUN npm run lint && npm test
+
+# Les dépendances sont installées sur une base Debian (glibc) pour être compatibles avec distroless (Debian 12)
+FROM node:20.20.2-bookworm-slim AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev --no-audit --no-fund
+
+FROM gcr.io/distroless/nodejs20-debian12:nonroot AS runtime
+ARG APP_VERSION=dev
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.title="shopapi" \
+      org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.revision="${GIT_SHA}" \
+      org.opencontainers.image.source="https://github.com/christopheutp/docker_ynov_10_26"
+ENV NODE_ENV=production APP_VERSION=${APP_VERSION} PORT=3000
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY package.json ./
+COPY --from=test /app/src ./src
+EXPOSE 3000
+# Pas de wget ni de shell : le healthcheck utilise le binaire node de l'image
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+  CMD ["/nodejs/bin/node", "-e", "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+# L'ENTRYPOINT de l'image est déjà node
+CMD ["src/server.js"]

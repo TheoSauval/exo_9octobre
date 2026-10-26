@@ -14,6 +14,7 @@ Exercices réalisés avec Docker Desktop (macOS, Apple Silicon).
 | 8 | API Spring Boot CRUD + PostgreSQL | `exercice-docker-8.md` | `exo-08/` |
 | 9 | API CRUD + API de logs (compose) | `exercice-docker-9.md` | `exo-09/` |
 | 10 | Compose : variables d'environnement (`.env`) et volumes | `exercice-docker-10.md` | `exo-10/` |
+| 11 | TP01 : optimisation d'une image « historique » (multi-stage, non-root, healthcheck, distroless) | `exercice-docker-11.md` | `exo-11/` |
 
 Captures navigateur : `captures/`.
 

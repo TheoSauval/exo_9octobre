@@ -1,0 +1,6 @@
+# Liste blanche : tout est exclu sauf ce qui est nécessaire au build
+*
+!package.json
+!package-lock.json
+!src/
+!test/
