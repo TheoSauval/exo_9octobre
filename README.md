@@ -15,9 +15,12 @@ Exercices réalisés avec Docker Desktop (macOS, Apple Silicon).
 | 9 | API CRUD + API de logs (compose) | `exercice-docker-9.md` | `exo-09/` |
 | 10 | Compose : variables d'environnement (`.env`) et volumes | `exercice-docker-10.md` | `exo-10/` |
 | 11 | TP01 : optimisation d'une image « historique » (multi-stage, non-root, healthcheck, distroless) | `exercice-docker-11.md` | `exo-11/` |
+| 12 | TP04 : stack Compose d'entreprise (base, surcharges dev/prod, Traefik, secrets, Makefile) | `exercice-docker-12.md` | `exo-12/` |
+| 13 | TP05 : persistance, sauvegarde/restauration, montée PostgreSQL 14 → 16 | `exercice-docker-13.md` | `exo-13/` |
 
 Captures navigateur : `captures/`.
 
 ## Remarque
 
 Les exercices 1 à 6, 9 et 10 utilisent tous le port 8080 : un seul peut tourner à la fois.
+L'exercice 12 utilise le port 80 (Traefik) ; ses ports de debug se règlent dans `exo-12/.env`.

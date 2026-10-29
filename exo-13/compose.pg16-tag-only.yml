@@ -1,0 +1,4 @@
+# Contre-exemple : on change seulement le tag, sur le volume PG14 existant.
+services:
+  db:
+    image: postgres:16.4-alpine

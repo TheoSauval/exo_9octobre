@@ -1,0 +1,48 @@
+# syntax=docker/dockerfile:1.7
+# shopapi : image de production (multi-stage)
+
+ARG NODE_IMAGE=node:20.20.2-alpine3.22
+
+# ---- base : manifestes npm uniquement (couche stable, en cache tant que les dépendances ne changent pas)
+FROM ${NODE_IMAGE} AS base
+WORKDIR /app
+COPY package.json package-lock.json ./
+
+# ---- deps : dépendances de production seulement
+FROM base AS deps
+ENV NODE_ENV=production
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --omit=dev --no-audit --no-fund
+
+# ---- test : dépendances complètes + lint + tests (le build échoue si un test échoue)
+FROM base AS test
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --no-audit --no-fund
+COPY src ./src
+COPY test ./test
+RUN npm run lint && npm test
+
+# ---- runtime : image finale
+FROM ${NODE_IMAGE} AS runtime
+ARG APP_VERSION=dev
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.title="shopapi" \
+      org.opencontainers.image.description="API catalogue produits Shop SAS" \
+      org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.revision="${GIT_SHA}" \
+      org.opencontainers.image.source="https://github.com/christopheutp/docker_ynov_10_26" \
+      org.opencontainers.image.licenses="UNLICENSED"
+ENV NODE_ENV=production \
+    APP_VERSION=${APP_VERSION} \
+    PORT=3000
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY package.json ./
+# src est copié depuis l'étape test : l'image finale ne peut pas être construite si les tests échouent
+COPY --from=test /app/src ./src
+# utilisateur node de l'image officielle (uid/gid numériques : vérifiable par Kubernetes runAsNonRoot)
+USER 1000:1000
+EXPOSE 3000
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+  CMD ["node", "-e", "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+CMD ["node", "src/server.js"]

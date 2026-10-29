@@ -1,0 +1,26 @@
+# Sidecar de sauvegarde planifiée pour la stack du TP04 :
+# docker compose -f ../exo-12/compose.yml -f ../exo-12/compose.override.yml -f compose.backup.yml up -d --wait backup
+services:
+  backup:
+    image: prodrigestivill/postgres-backup-local:16
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB:-shop}
+      POSTGRES_USER: ${POSTGRES_USER:-shop}
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      POSTGRES_EXTRA_OPTS: "-Z6 --schema=public --blobs"
+      SCHEDULE: "${BACKUP_SCHEDULE:-@daily}"   # @every 1m pour le test
+      BACKUP_KEEP_DAYS: 7
+      BACKUP_KEEP_WEEKS: 4
+      BACKUP_KEEP_MONTHS: 6
+      HEALTHCHECK_PORT: 8080
+    secrets: [db_password]
+    volumes:
+      - pgbackups:/backups
+    networks: [back]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  pgbackups: {}
