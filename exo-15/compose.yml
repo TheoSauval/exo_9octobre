@@ -1,0 +1,189 @@
+# Stack Shop SAS : fichier de base commun à tous les environnements.
+# Dev  : docker compose up -d --wait            (compose.override.yml appliqué automatiquement)
+# Prod : docker compose -f compose.yml -f compose.prod.yml up -d --wait
+name: shop
+
+x-healthcheck-defaults: &healthcheck-defaults
+  interval: 5s
+  timeout: 3s
+  retries: 10
+  start_period: 10s
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Construit DATABASE_URL à partir du secret au démarrage, puis exec la commande du service :
+# le code n'est pas modifié et le processus applicatif reste PID 1 (signaux reçus).
+x-db-url-entrypoint: &db-url-entrypoint
+  - /bin/sh
+  - -c
+  - 'export DATABASE_URL="postgres://$${POSTGRES_USER}:$$(cat /run/secrets/db_password)@db:5432/$${POSTGRES_DB}"; exec "$$@"'
+  - --
+
+x-app-env: &app-env
+  POSTGRES_USER: ${POSTGRES_USER:-shop}
+  POSTGRES_DB: ${POSTGRES_DB:-shop}
+  REDIS_URL: redis://redis:6379
+
+services:
+  proxy:
+    image: traefik:v3.1
+    # configuration statique par variables d'environnement : les surcharges peuvent en ajouter
+    environment:
+      TRAEFIK_ENTRYPOINTS_WEB_ADDRESS: ":80"
+      TRAEFIK_PROVIDERS_DOCKER: "true"
+      TRAEFIK_PROVIDERS_DOCKER_EXPOSEDBYDEFAULT: "false"
+      TRAEFIK_PROVIDERS_DOCKER_NETWORK: shop_front
+      TRAEFIK_PING: "true"
+      TRAEFIK_ACCESSLOG: "true"
+      TRAEFIK_ACCESSLOG_FORMAT: json
+      TRAEFIK_LOG_LEVEL: INFO
+    ports:
+      - "80:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [front]
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+    logging: *logging
+    restart: unless-stopped
+
+  api:
+    build: ./apps/shopapi
+    image: shopapi:local
+    entrypoint: *db-url-entrypoint
+    command: ["node", "src/server.js"]
+    environment:
+      <<: *app-env
+      LOG_LEVEL: info          # pino : niveaux en minuscules
+    secrets: [db_password]
+    networks: [front, back]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/ready').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.api.rule: Host(`api.localhost`)
+      traefik.http.routers.api.entrypoints: web
+      traefik.http.services.api.loadbalancer.server.port: "3000"
+      traefik.http.services.api.loadbalancer.healthcheck.path: /health
+      traefik.http.services.api.loadbalancer.healthcheck.interval: 5s
+    logging: *logging
+    restart: unless-stopped
+
+  worker:
+    build: ./apps/shop-worker
+    image: shop-worker:local
+    entrypoint: *db-url-entrypoint
+    command: ["python", "-m", "worker.main"]
+    environment:
+      <<: *app-env
+      LOG_LEVEL: INFO          # logging Python : niveaux en majuscules
+    secrets: [db_password]
+    networks: [back]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9100/metrics', timeout=2)"]
+    logging: *logging
+    restart: unless-stopped
+
+  db:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-shop}
+      POSTGRES_DB: ${POSTGRES_DB:-shop}
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    networks: [back]
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+    logging: *logging
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    networks: [back]
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "redis-cli", "ping"]
+    logging: *logging
+    restart: unless-stopped
+
+  # ---- outils à la demande ----
+  adminer:
+    image: adminer:4.8.1
+    profiles: [tools]
+    environment:
+      ADMINER_DEFAULT_SERVER: db
+    networks: [front, back]
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "php", "-r", "exit((@fsockopen('127.0.0.1', 8080) || @fsockopen('[::1]', 8080)) ? 0 : 1);"]
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.adminer.rule: Host(`adminer.localhost`)
+      traefik.http.routers.adminer.entrypoints: web
+      traefik.http.services.adminer.loadbalancer.server.port: "8080"
+    logging: *logging
+    restart: unless-stopped
+
+  migrate:
+    image: postgres:16.4-alpine
+    profiles: [ops]
+    environment:
+      PGHOST: db
+      PGUSER: ${POSTGRES_USER:-shop}
+      PGDATABASE: ${POSTGRES_DB:-shop}
+      MIGRATION: ${MIGRATION:-}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'test -n "$${MIGRATION}" || { echo "MIGRATION non définie (ex: MIGRATION=002-add-sku.sql)"; exit 2; }; export PGPASSWORD="$$(cat /run/secrets/db_password)"; exec psql -v ON_ERROR_STOP=1 -f "/migrations/$${MIGRATION}"'
+    secrets: [db_password]
+    volumes:
+      - ./db/migrations:/migrations:ro
+    networks: [back]
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    logging: *logging
+    restart: "no"
+
+networks:
+  front: {}
+  back:
+    internal: true
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt

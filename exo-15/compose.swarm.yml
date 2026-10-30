@@ -1,0 +1,151 @@
+# Bonus B1 : la même stack en Docker Swarm (mise à jour progressive native)
+#   docker stack deploy -c compose.swarm.yml --resolve-image never --detach=false shop
+# Format "stack" : pas de build, pas de depends_on conditionnel ; les secrets et configs sont lus
+# sur la machine qui lance la commande puis stockés (chiffrés) dans le Raft du swarm.
+version: "3.9"
+
+x-healthcheck: &healthcheck
+  interval: 5s
+  timeout: 3s
+  retries: 10
+  start_period: 10s
+
+x-db-url-entrypoint: &db-url-entrypoint
+  - /bin/sh
+  - -c
+  - 'export DATABASE_URL="postgres://$${POSTGRES_USER}:$$(cat /run/secrets/db_password)@db:5432/$${POSTGRES_DB}"; exec "$$@"'
+  - --
+
+x-app-env: &app-env
+  POSTGRES_USER: shop
+  POSTGRES_DB: shop
+  REDIS_URL: redis://redis:6379
+
+services:
+  proxy:
+    image: traefik:v3.1
+    command:
+      - --entrypoints.web.address=:80
+      - --providers.swarm=true
+      - --providers.swarm.exposedbydefault=false
+      - --providers.swarm.network=shop_front
+      - --providers.swarm.refreshseconds=5
+      - --ping=true
+      - --accesslog=true
+      - --accesslog.format=json
+    ports:
+      - target: 80
+        published: 80
+        mode: host          # port publié directement sur le nœud (pas de routing mesh)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [front]
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+    deploy:
+      placement:
+        constraints: [node.role == manager]
+
+  api:
+    image: ${REGISTRY:?REGISTRY doit être défini}/shopapi:${VERSION:?VERSION doit être défini}
+    entrypoint: *db-url-entrypoint
+    command: ["node", "src/server.js"]
+    environment:
+      <<: *app-env
+      LOG_LEVEL: info
+    secrets: [db_password]
+    networks: [front, back]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/ready').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+    stop_grace_period: 15s
+    deploy:
+      replicas: 2
+      update_config:
+        parallelism: 1          # un réplica à la fois
+        order: start-first      # le nouveau démarre (et doit être healthy) avant l'arrêt de l'ancien
+        delay: 2s
+        monitor: 15s            # surveillance après chaque remplacement
+        failure_action: rollback
+      rollback_config:
+        parallelism: 1
+        order: start-first
+      resources:
+        limits: { cpus: "0.50", memory: 256M }
+      labels:
+        traefik.enable: "true"
+        traefik.http.routers.api.rule: Host(`api.localhost`)
+        traefik.http.routers.api.entrypoints: web
+        traefik.http.routers.api.middlewares: api-retry
+        traefik.http.middlewares.api-retry.retry.attempts: "3"
+        traefik.http.services.api.loadbalancer.server.port: "3000"
+        traefik.swarm.lbswarm: "true"    # Traefik passe par l'IP virtuelle du service : swarm gère les entrées/sorties
+
+  worker:
+    image: ${REGISTRY:?REGISTRY doit être défini}/shop-worker:${VERSION:?VERSION doit être défini}
+    entrypoint: *db-url-entrypoint
+    command: ["python", "-m", "worker.main"]
+    environment:
+      <<: *app-env
+      LOG_LEVEL: INFO
+    secrets: [db_password]
+    networks: [back]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9100/metrics', timeout=2)"]
+    stop_grace_period: 15s
+    deploy:
+      update_config: { order: start-first, failure_action: rollback }
+
+  db:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_USER: shop
+      POSTGRES_DB: shop
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    configs:
+      - source: db_init
+        target: /docker-entrypoint-initdb.d/001-init.sql
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [back]
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "pg_isready -U shop -d shop"]
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    networks: [back]
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "redis-cli", "ping"]
+
+networks:
+  front:
+    driver: overlay
+  back:
+    driver: overlay
+    internal: true
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+
+configs:
+  db_init:
+    file: ./db/init.sql

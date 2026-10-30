@@ -1,0 +1,68 @@
+# Surcharge PROD : docker compose -f compose.yml -f compose.prod.yml up -d --wait
+# Images tirées du registre (pas de build), durcissement, limites, réplicas, arrêt propre.
+
+x-hardening: &hardening
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  proxy:
+    deploy:
+      resources:
+        limits: { cpus: "0.50", memory: 128M }
+
+  api:
+    build: !reset null
+    image: ${REGISTRY:?REGISTRY doit être défini}/shopapi:${VERSION:?VERSION doit être défini}
+    <<: *hardening
+    environment:
+      LOG_LEVEL: info
+    # SIGTERM puis 15 s pour finir les requêtes en cours avant SIGKILL
+    stop_grace_period: 15s
+    labels:
+      # une requête qui tombe sur un réplica en cours d'arrêt (connexion refusée) est rejouée sur un autre
+      traefik.http.routers.api.middlewares: api-retry
+      traefik.http.middlewares.api-retry.retry.attempts: "3"
+    deploy:
+      replicas: 2
+      resources:
+        limits: { cpus: "0.50", memory: 256M }
+        reservations: { memory: 64M }
+
+  worker:
+    build: !reset null
+    image: ${REGISTRY:?REGISTRY doit être défini}/shop-worker:${VERSION:?VERSION doit être défini}
+    <<: *hardening
+    stop_grace_period: 15s
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 128M }
+
+  db:
+    # pas de cap_drop ALL : l'entrypoint postgres a besoin de CHOWN/SETUID/SETGID/DAC_OVERRIDE/FOWNER
+    security_opt:
+      - no-new-privileges:true
+    shm_size: 256m
+    volumes:
+      # même cible que dans compose.yml : la source est remplacée. Sur un serveur distant (docker context),
+      # un bind mount désigne un chemin DU SERVEUR : SHOP_CONF_DIR=/srv/shop, provisionné hors git.
+      - ${SHOP_CONF_DIR:-.}/db/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+
+  redis:
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 128M }
+
+secrets:
+  db_password:
+    # le secret reste sur le serveur (fichier hors git) ; seul son chemin est dans le dépôt
+    file: ${SHOP_CONF_DIR:-.}/secrets/db_password.txt

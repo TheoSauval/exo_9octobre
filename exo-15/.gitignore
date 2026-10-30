@@ -1,0 +1,8 @@
+.env
+secrets/*
+!secrets/.gitkeep
+ci/pip.conf
+ci/keys/*
+!ci/keys/cosign.pub
+.ci/
+backups/

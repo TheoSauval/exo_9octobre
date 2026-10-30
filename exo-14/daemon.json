@@ -1,0 +1,16 @@
+{
+  "no-new-privileges": true,
+  "icc": false,
+  "live-restore": true,
+  "userland-proxy": false,
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  },
+  "userns-remap": "default",
+  "default-ulimits": {
+    "nofile": { "Name": "nofile", "Soft": 65536, "Hard": 65536 },
+    "nproc": { "Name": "nproc", "Soft": 4096, "Hard": 4096 }
+  }
+}

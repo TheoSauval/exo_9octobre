@@ -1,0 +1,32 @@
+# Surcharge DEV : appliquée automatiquement par `docker compose up` (pas en prod, où l'on passe -f explicitement).
+services:
+  proxy:
+    environment:
+      TRAEFIK_API_DASHBOARD: "true"
+      TRAEFIK_API_INSECURE: "true"   # dashboard sur :8080, uniquement en dev
+      TRAEFIK_LOG_LEVEL: DEBUG
+    ports:
+      - "${TRAEFIK_DASHBOARD_PORT:-8080}:8080"
+
+  api:
+    command: ["node", "--watch", "src/server.js"]
+    environment:
+      LOG_LEVEL: debug
+    volumes:
+      - ./apps/shopapi/src:/app/src:ro   # code monté depuis l'hôte, rechargé par node --watch
+    ports:
+      - "${API_DEBUG_PORT:-3000}:3000"
+
+  worker:
+    environment:
+      LOG_LEVEL: DEBUG
+
+  db:
+    # back est "internal" : Docker ne publie pas de port pour un réseau sans passerelle.
+    # On ajoute donc db à un réseau dev dédié, uniquement en dev, pour exposer 5432 à l'hôte.
+    networks: [back, dbdebug]
+    ports:
+      - "${DB_DEBUG_PORT:-5432}:5432"
+
+networks:
+  dbdebug: {}

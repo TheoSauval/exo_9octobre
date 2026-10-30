@@ -1,0 +1,211 @@
+# Pipeline Shop SAS
+#   pull request : lint, étape test, build multi-arch sans push, test d'intégration
+#   main         : + push sha-<sha> sur GHCR, scan trivy bloquant, signature cosign keyless, déploiement préprod
+#   tag v*       : + tags semver, déploiement prod après approbation manuelle (environment "production")
+#                  et vérification de la signature côté déploiement
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: hadolint (api)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: apps/shopapi/Dockerfile
+          ignore: DL3006   # faux positif de hadolint 2.12 sur "FROM ${ARG}" (valeur par défaut épinglée)
+      - name: hadolint (worker)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: apps/shop-worker/Dockerfile
+          ignore: DL3006   # faux positif de hadolint 2.12 sur "FROM ${ARG}" (valeur par défaut épinglée)
+      - name: docker compose config
+        run: |
+          mkdir -p secrets && openssl rand -hex 24 > secrets/db_password.txt
+          docker compose -f compose.yml config -q
+          REGISTRY=ghcr.io/ci VERSION=ci docker compose -f compose.yml -f compose.prod.yml config -q
+
+  integration:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stack complète + smoke test
+        run: |
+          mkdir -p secrets && openssl rand -hex 24 > secrets/db_password.txt
+          docker compose -f compose.yml up -d --build --wait
+          ./smoke-test.sh
+      - name: Nettoyage
+        if: always()
+        run: docker compose -f compose.yml down -v
+
+  build:
+    needs: lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write     # push GHCR
+      id-token: write     # jeton OIDC pour cosign keyless
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: api
+            image: shopapi
+            context: apps/shopapi
+          - name: worker
+            image: shop-worker
+            context: apps/shop-worker
+    steps:
+      - uses: actions/checkout@v4
+      - name: Registre (nom en minuscules)
+        run: echo "REGISTRY=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Étape test (lint + tests unitaires dans le build)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          target: test
+          push: false
+          cache-from: type=gha,scope=${{ matrix.name }}
+          secrets: |
+            pipconf=${{ secrets.PIP_CONF }}
+
+      - name: Métadonnées (tags et labels OCI)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ matrix.image }}
+          flavor: latest=false
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Connexion GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build multi-arch (+ push hors PR)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.version }}
+            GIT_SHA=${{ github.sha }}
+          secrets: |
+            pipconf=${{ secrets.PIP_CONF }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,scope=${{ matrix.name }},mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Scan trivy (bloquant sur CRITICAL corrigible)
+        if: github.event_name != 'pull_request'
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - uses: sigstore/cosign-installer@v3
+        if: github.event_name != 'pull_request'
+
+      - name: Signature cosign keyless (OIDC GitHub)
+        if: github.event_name != 'pull_request'
+        env:
+          REF: ${{ env.REGISTRY }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$REF"
+
+  deploy-preprod:
+    if: github.ref == 'refs/heads/main'
+    needs: [build, integration]
+    runs-on: ubuntu-latest
+    environment: preprod
+    concurrency: deploy-preprod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: sigstore/cosign-installer@v3
+      - name: Contexte Docker distant (SSH)
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_HOST: ${{ vars.PREPROD_HOST }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          docker context create preprod --docker "host=ssh://deploy@${DEPLOY_HOST}"
+      - name: Connexion GHCR (pull par le serveur)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Rolling update (signature vérifiée avant déploiement)
+        run: |
+          VERSION="sha-${GITHUB_SHA::7}" \
+          REGISTRY="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}" \
+          DEPLOY_CONTEXT=preprod \
+          COSIGN_IDENTITY_REGEXP="^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci.yml@refs/heads/main$" \
+          ./deploy/rolling-update.sh
+
+  deploy-prod:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    # environment protégé : "required reviewers" dans Settings > Environments -> approbation manuelle
+    environment: production
+    concurrency: deploy-prod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: sigstore/cosign-installer@v3
+      - name: Contexte Docker distant (SSH)
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_HOST: ${{ vars.PROD_HOST }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          docker context create prod --docker "host=ssh://deploy@${DEPLOY_HOST}"
+      - name: Connexion GHCR (pull par le serveur)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Rolling update de la version taguée
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}" \
+          REGISTRY="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}" \
+          DEPLOY_CONTEXT=prod \
+          COSIGN_IDENTITY_REGEXP="^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci.yml@refs/tags/v" \
+          ./deploy/rolling-update.sh

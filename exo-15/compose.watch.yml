@@ -1,0 +1,20 @@
+# Bonus B1 : docker compose -f compose.yml -f compose.watch.yml watch
+# Remplace le bind mount du compose.override.yml par la synchronisation de Compose.
+services:
+  api:
+    # Compose watch résout l'utilisateur du conteneur avec getent pour attribuer les fichiers copiés :
+    # "USER 1000:1000" (numérique) n'a pas d'entrée passwd sous ce nom, la synchronisation échoue.
+    # On donne donc le nom de l'utilisateur, qui correspond au même uid 1000.
+    user: node
+    command: ["node", "--watch", "src/server.js"]
+    environment:
+      LOG_LEVEL: debug
+    develop:
+      watch:
+        - action: sync            # copie le fichier modifié dans le conteneur, node --watch recharge
+          path: ./apps/shopapi/src
+          target: /app/src
+        - action: rebuild         # nouvelles dépendances : il faut reconstruire l'image
+          path: ./apps/shopapi/package.json
+        - action: rebuild
+          path: ./apps/shopapi/package-lock.json

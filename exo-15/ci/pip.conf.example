@@ -1,0 +1,4 @@
+# Copié en ci/pip.conf (non versionné) par ci-local.sh. En entreprise : index interne avec identifiants.
+# En CI GitHub : secret de dépôt PIP_CONF, passé au build par "secrets: pipconf=...".
+[global]
+index-url = https://pypi.org/simple

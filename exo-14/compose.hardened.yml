@@ -1,0 +1,133 @@
+# compose.hardened.yml : surcharge de durcissement de la stack du TP04
+#
+#   cd ../exo-12
+#   docker compose -f compose.yml -f ../exo-14/compose.hardened.yml up -d --wait
+#
+# Chaque directive est commentée par la menace qu'elle réduit.
+# Les chemins relatifs d'une surcharge sont résolus depuis le dossier du premier fichier (exo-12) :
+# ce fichier n'en utilise donc aucun.
+
+x-hardened: &hardened
+  # no-new-privileges : un binaire setuid/setgid ou une file capability ne donne plus de privilèges
+  #   -> bloque l'escalade locale (su, passwd, binaire setuid déposé par un attaquant)
+  security_opt:
+    - no-new-privileges:true
+  # cap_drop ALL : retire les 14 capabilities accordées par défaut (CHOWN, NET_RAW, SETUID, KILL...)
+  #   -> même root dans le conteneur ne peut plus forger de paquets, changer de propriétaire ou d'uid
+  cap_drop: [ALL]
+  # read_only : système de fichiers racine en lecture seule
+  #   -> impossible de déposer un outil, de modifier le code ou la configuration d'un conteneur compromis
+  read_only: true
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # ---- Proxy de socket : le seul conteneur qui voit la socket Docker ----
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.2.0
+    <<: *hardened
+    # Socket en lecture seule. Le proxy (haproxy) ne laisse passer que les appels autorisés ci-dessous :
+    #   -> Traefik compromis ne peut plus créer un conteneur --privileged qui monte / (équivalent root hôte)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      CONTAINERS: 1      # GET /containers/... : lecture des labels, seul besoin de Traefik
+      EVENTS: 1          # GET /events : Traefik suit les démarrages/arrêts
+      POST: 0            # toute écriture (POST, PUT, DELETE) refusée : ni création, ni arrêt, ni exec
+    # L'entrypoint de l'image écrit sa configuration dans /usr/local/etc/haproxy/haproxy.cfg, ce qui échoue
+    # avec read_only ("Read-only file system"). On génère la même configuration dans /tmp (tmpfs) et on lance
+    # haproxy avec les mêmes options que l'image (-W -db), en écoute IPv4 (:2375).
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'sed "s/[$$][{]BIND_CONFIG[}]/:2375/" /usr/local/etc/haproxy/haproxy.cfg.template > /tmp/haproxy.cfg && exec haproxy -W -db -f /tmp/haproxy.cfg'
+    tmpfs:
+      - /run             # pid haproxy
+      - /tmp             # configuration haproxy générée au démarrage
+    # Réseau interne dédié : joignable uniquement par Traefik, aucun accès à Internet
+    networks: [socket]
+    labels:
+      # haproxy doit tourner en root pour lire la socket (root:root 660) et monte la socket : c'est son rôle.
+      audit.exceptions: "user,socket"
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 64M, pids: 50 }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:2375/_ping || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    logging: *logging
+    restart: unless-stopped
+
+  # ---- Reverse proxy ----
+  proxy:
+    <<: *hardened
+    # Utilisateur nobody : Traefik est le seul service exposé à Internet, c'est le plus attaqué
+    user: "65534:65534"
+    # Port 80 sans CAP_NET_BIND_SERVICE : le seuil des ports privilégiés est abaissé dans le seul
+    # espace réseau du conteneur (sysctl "namespacé", sans effet sur l'hôte). Docker le fait déjà
+    # par défaut ; on l'écrit pour ne pas en dépendre.
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
+    environment:
+      # plus de socket : Traefik interroge le proxy en HTTP sur le réseau interne
+      TRAEFIK_PROVIDERS_DOCKER_ENDPOINT: tcp://socket-proxy:2375
+    # supprime le montage /var/run/docker.sock hérité du compose de base
+    volumes: !reset []
+    networks: [front, socket]
+    tmpfs: [/tmp]
+    depends_on:
+      socket-proxy:
+        condition: service_healthy
+    # limites : une boucle ou une fuite mémoire ne peut pas affamer l'hôte (déni de service)
+    deploy:
+      resources:
+        limits: { cpus: "0.50", memory: 128M, pids: 100 }
+
+  api:
+    <<: *hardened
+    # déjà non-root (USER 1000:1000 dans l'image, TP01)
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits: { cpus: "0.50", memory: 256M, pids: 100 }   # fork bomb contenue
+
+  worker:
+    <<: *hardened
+    # déjà non-root (USER 10001 dans l'image)
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 128M, pids: 50 }
+
+  db:
+    <<: *hardened
+    # L'entrypoint postgres démarre en root pour corriger les droits puis passe en postgres (su-exec),
+    # ce qui demande des capabilities (voir les essais du rendu). En démarrant directement en postgres
+    # (uid 70, propriétaire du volume), aucune capability n'est nécessaire.
+    user: postgres
+    tmpfs:
+      - /var/run/postgresql   # socket unix du serveur (le rootfs est en lecture seule)
+      - /tmp
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M, pids: 200 }   # un processus par connexion + processus de fond
+
+  redis:
+    <<: *hardened
+    # même principe que postgres : l'entrypoint ne repasse plus par root (uid 999, propriétaire de /data)
+    user: redis
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 128M, pids: 50 }
+
+networks:
+  socket:
+    internal: true

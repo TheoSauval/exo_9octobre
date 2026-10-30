@@ -17,6 +17,8 @@ Exercices réalisés avec Docker Desktop (macOS, Apple Silicon).
 | 11 | TP01 : optimisation d'une image « historique » (multi-stage, non-root, healthcheck, distroless) | `exercice-docker-11.md` | `exo-11/` |
 | 12 | TP04 : stack Compose d'entreprise (base, surcharges dev/prod, Traefik, secrets, Makefile) | `exercice-docker-12.md` | `exo-12/` |
 | 13 | TP05 : persistance, sauvegarde/restauration, montée PostgreSQL 14 → 16 | `exercice-docker-13.md` | `exo-13/` |
+| 14 | TP08 : durcissement (audit, capabilities, proxy de socket, daemon.json) | `exercice-docker-14.md` | `exo-14/` |
+| 15 | TP09 : CI/CD et déploiement sans interruption (pipeline, cosign, rolling update) | `exercice-docker-15.md` | `exo-15/` |
 
 Captures navigateur : `captures/`.
 
